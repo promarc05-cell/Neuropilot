@@ -1,9 +1,8 @@
-
 import json
 import os
 import re
+from typing import Any
 
-from dotenv import load_dotenv
 from groq import Groq
 from pydantic import ValidationError
 
@@ -13,162 +12,207 @@ from backend.services.prompts import NEUROPILOT_SYSTEM_PROMPT
 
 MODEL_NAME = "openai/gpt-oss-20b"
 
-load_dotenv()
+
+def _extract_json(response_text: str) -> dict[str, Any]:
+    """
+    Extract a JSON object from the model response.
+    Handles plain JSON and JSON wrapped in Markdown fences.
+    """
+    text = response_text.strip()
+
+    # Remove Markdown code fences if the model includes them.
+    text = re.sub(
+        r"^\s*```(?:json)?\s*|\s*```\s*$",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    ).strip()
+
+    try:
+        result = json.loads(text)
+    except json.JSONDecodeError:
+        # If extra text surrounds the JSON, try to locate the object.
+        start = text.find("{")
+        end = text.rfind("}")
+
+        if start == -1 or end <= start:
+            raise ValueError("The AI response did not contain a valid JSON object.")
+
+        try:
+            result = json.loads(text[start:end + 1])
+        except json.JSONDecodeError as error:
+            raise ValueError(
+                f"The AI returned malformed JSON: {error}"
+            ) from error
+
+    if not isinstance(result, dict):
+        raise ValueError("The AI response must be a JSON object.")
+
+    return result
+
+
+def _validate_task_ids(plan: dict[str, Any]) -> None:
+    """
+    Check task identifiers and dependencies before returning the plan.
+    """
+    tasks = plan.get("tasks")
+
+    if not isinstance(tasks, list) or not tasks:
+        raise ValueError("The AI must generate at least one task.")
+
+    task_ids = []
+
+    for task in tasks:
+        if not isinstance(task, dict):
+            raise ValueError("Every generated task must be an object.")
+
+        task_id = task.get("task_id")
+
+        if not isinstance(task_id, str) or not task_id.strip():
+            raise ValueError("Every task must have a non-empty task_id.")
+
+        task_ids.append(task_id)
+
+        title = task.get("title")
+        if not isinstance(title, str) or not title.strip():
+            raise ValueError("Every task must have a non-empty title.")
+
+        duration = task.get("duration_minutes")
+        if not isinstance(duration, (int, float)) or isinstance(duration, bool):
+            raise ValueError(
+                f"Task '{task_id}' must have a numeric duration_minutes."
+            )
+
+        if duration <= 0:
+            raise ValueError(
+                f"Task '{task_id}' must have a positive duration."
+            )
+
+    if len(task_ids) != len(set(task_ids)):
+        raise ValueError("The AI generated duplicate task IDs.")
+
+    known_ids = set(task_ids)
+
+    for task in tasks:
+        dependencies = task.get("dependencies", [])
+
+        if not isinstance(dependencies, list):
+            raise ValueError(
+                f"Dependencies for task '{task['task_id']}' must be a list."
+            )
+
+        if task["task_id"] in dependencies:
+            raise ValueError(
+                f"Task '{task['task_id']}' cannot depend on itself."
+            )
+
+        for dependency_id in dependencies:
+            if dependency_id not in known_ids:
+                raise ValueError(
+                    f"Task '{task['task_id']}' references unknown dependency "
+                    f"'{dependency_id}'."
+                )
 
 
 def generate_ai_tasks(assignment: dict) -> dict:
     """
-    Generate a dynamic task plan using Groq.
+    Generate assignment-specific tasks using Groq.
 
-    Input:
-        Assignment dictionary produced by assignment_analyzer.py.
-
-    Output:
-        {
-            "assignment_summary": str,
-            "assignment_type": str,
-            "tasks": list[dict]
-        }
-
-    Raises an error if the AI response cannot be parsed
-    or does not match the TaskPlan schema.
+    The assignment analyzer provides the structured context.
+    The AI proposes meaningful tasks.
+    TaskPlan validates the resulting structure.
+    The scheduler remains responsible for assigning dates.
     """
-
     api_key = os.getenv("GROQ_API_KEY")
 
     if not api_key:
-        raise RuntimeError(
-            "GROQ_API_KEY is not set in this terminal."
-        )
-
-    raw_text = assignment.get("raw_text", "").strip()
-
-    if not raw_text:
         raise ValueError(
-            "The assignment must contain raw_text."
+            "GROQ_API_KEY is missing. Add your valid Groq API key "
+            "to the environment configuration."
         )
 
-    # Convert date objects and other values into JSON-safe data.
+    raw_text = assignment.get("raw_text")
+
+    if not isinstance(raw_text, str) or not raw_text.strip():
+        raise ValueError("The assignment must contain non-empty raw_text.")
+
+    client = Groq(api_key=api_key)
+
     assignment_context = {
         key: value.isoformat() if hasattr(value, "isoformat") else value
         for key, value in assignment.items()
     }
 
-    client = Groq(api_key=api_key)
+    user_prompt = f"""
+Create a task plan for the following assignment.
 
-    response = client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    NEUROPILOT_SYSTEM_PROMPT
-                    + """
+ASSIGNMENT CONTEXT:
+{json.dumps(assignment_context, ensure_ascii=False, indent=2)}
 
-IMPORTANT OUTPUT INSTRUCTIONS:
-Return exactly one valid JSON object.
-Do not use Markdown fences.
-Do not include explanations outside the JSON.
-Every completion_criteria field must be an array of strings.
-Every prerequisite_ids field must be an array of strings.
-Generate specific, manageable steps for the actual assignment.
-For recurring practice, generate the steps for ONE daily session.
-Do not generate calendar dates or schedule tasks.
+IMPORTANT REQUIREMENTS:
+
+1. Understand the actual meaning of the user's assignment.
+2. Generate tasks specifically relevant to the subject and requested activity.
+3. Do not use generic phases such as "study fundamentals" unless they
+   genuinely fit the assignment.
+4. For a subject-specific request, use meaningful subject-specific topics
+   and activities. Do not invent detailed syllabus topics when the user's
+   subject is too vague; create sensible actions or state the assumption.
+5. Respect stated quantities, such as pages, sources, slides, practice
+   duration, and other deliverables.
+6. Put prerequisite tasks before the tasks that depend on them.
+7. Make every task a concrete action with a clear title and description.
+8. Estimate each task's duration in minutes.
+9. Do not create the calendar schedule. The Python scheduler handles dates.
+10. Do not interpret a total duration as a daily duration unless the user
+    explicitly requests a daily or recurring activity.
+11. Do not invent a deadline if the user did not provide one.
+12. Return only the JSON object required by the system instructions.
 """
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    "Generate a task plan for this student's assignment.\n\n"
-                    "RAW ASSIGNMENT:\n"
-                    f"{raw_text}\n\n"
-                    "EXTRACTED ASSIGNMENT INFORMATION:\n"
-                    f"{json.dumps(assignment_context, ensure_ascii=False)}\n\n"
-                    "Return JSON with these top-level fields:\n"
-                    "assignment_summary, assignment_type, tasks.\n"
-                    "Each task must contain task_id, parent_task_id, "
-                    "title, description, duration_minutes, difficulty, "
-                    "prerequisite_ids, completion_criteria."
-                ),
-            },
-        ],
-        temperature=0,
-        max_completion_tokens=4000,
-    )
-
-    content = response.choices[0].message.content
-
-    if not content or not content.strip():
-        raise RuntimeError(
-            "Groq returned an empty task plan."
-        )
-
-    # Extract JSON if the model unexpectedly adds surrounding text.
-    match = re.search(r"\{.*\}", content, flags=re.DOTALL)
-
-    if not match:
-        raise ValueError(
-            "Groq did not return a JSON object. "
-            f"Response received: {content}"
-        )
 
     try:
-        raw_plan = json.loads(match.group(0))
-        plan = TaskPlan.model_validate(raw_plan)
-    except (json.JSONDecodeError, ValidationError) as error:
-        raise ValueError(
-            "Groq returned a task plan that failed validation. "
-            f"Details: {error}\nResponse: {content}"
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {
+                    "role": "system",
+                    "content": NEUROPILOT_SYSTEM_PROMPT,
+                },
+                {
+                    "role": "user",
+                    "content": user_prompt,
+                },
+            ],
+            temperature=0.2,
+            response_format={"type": "json_object"},
+        )
+    except Exception as error:
+        raise RuntimeError(
+            f"Groq task generation failed: {error}"
         ) from error
 
-    # Validate relationships before passing tasks to the scheduler.
-    task_ids = [task.task_id for task in plan.tasks]
+    response_text = response.choices[0].message.content
 
-    if len(task_ids) != len(set(task_ids)):
+    if not response_text:
+        raise ValueError("The AI returned an empty response.")
+
+    ai_plan = _extract_json(response_text)
+
+    # Validate task IDs, task fields, and dependency references.
+    _validate_task_ids(ai_plan)
+
+    try:
+        validated_plan = TaskPlan.model_validate(ai_plan)
+    except ValidationError as error:
         raise ValueError(
-            "AI generated duplicate task IDs."
-        )
+            f"The AI-generated plan does not match TaskPlan: {error}"
+        ) from error
 
-    valid_ids = set(task_ids)
+    plan_data = validated_plan.model_dump()
 
-    for task in plan.tasks:
-        if task.parent_task_id and task.parent_task_id not in valid_ids:
-            raise ValueError(
-                f"Task '{task.task_id}' refers to a missing parent."
-            )
+    # Preserve the existing scheduler's expected duration field.
+    for task in plan_data["tasks"]:
+        if "duration_minutes" in task:
+            task["duration"] = int(task["duration_minutes"])
 
-        for prerequisite_id in task.prerequisite_ids:
-            if prerequisite_id not in valid_ids:
-                raise ValueError(
-                    f"Task '{task.task_id}' refers to missing "
-                    f"prerequisite '{prerequisite_id}'."
-                )
-
-            if prerequisite_id == task.task_id:
-                raise ValueError(
-                    f"Task '{task.task_id}' cannot depend on itself."
-                )
-
-    # Convert AI schema fields to the existing scheduler's format.
-    tasks = []
-
-    for task in plan.tasks:
-        tasks.append(
-            {
-                "task_id": task.task_id,
-                "parent_task_id": task.parent_task_id,
-                "title": task.title,
-                "description": task.description,
-                "duration": task.duration_minutes,
-                "difficulty": task.difficulty.value,
-                "prerequisite_ids": task.prerequisite_ids,
-                "completion_criteria": task.completion_criteria,
-            }
-        )
-
-    return {
-        "assignment_summary": plan.assignment_summary,
-        "assignment_type": plan.assignment_type,
-        "tasks": tasks,
-    }
+    return plan_data
