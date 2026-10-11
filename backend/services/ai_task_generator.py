@@ -3,6 +3,7 @@ import os
 import re
 from typing import Any
 
+from dotenv import load_dotenv
 from groq import Groq
 from pydantic import ValidationError
 
@@ -123,6 +124,7 @@ def generate_ai_tasks(assignment: dict) -> dict:
     TaskPlan validates the resulting structure.
     The scheduler remains responsible for assigning dates.
     """
+    load_dotenv()
     api_key = os.getenv("GROQ_API_KEY")
 
     if not api_key:
@@ -144,7 +146,7 @@ def generate_ai_tasks(assignment: dict) -> dict:
     }
 
     user_prompt = f"""
-Create a task plan for the following assignment.
+Create a task plan for the following assignment in valid JSON format.
 
 ASSIGNMENT CONTEXT:
 {json.dumps(assignment_context, ensure_ascii=False, indent=2)}
@@ -153,16 +155,19 @@ IMPORTANT REQUIREMENTS:
 
 1. Understand the actual meaning of the user's assignment.
 2. Generate tasks specifically relevant to the subject and requested activity.
-3. Do not use generic phases such as "study fundamentals" unless they
-   genuinely fit the assignment.
-4. For a subject-specific request, use meaningful subject-specific topics
-   and activities. Do not invent detailed syllabus topics when the user's
-   subject is too vague; create sensible actions or state the assumption.
+3. For a study, practice, or preparation assignment, provide a well-rounded progression
+   of 5 to 8 concrete steps covering the essential topics (e.g., core concepts, key structures,
+   algorithms, focused problem solving, and a final mock test simulation).
+4. For a subject-specific request (such as DSA, Python, Math, Web Development, etc.),
+   generate specific concrete topics, problem categories, and actionable exercises
+   (e.g., for DSA: arrays, strings, linked lists, trees, graphs, dynamic programming,
+   and mock placement test simulation). Do not output vague generic titles.
 5. Respect stated quantities, such as pages, sources, slides, practice
    duration, and other deliverables.
 6. Put prerequisite tasks before the tasks that depend on them.
 7. Make every task a concrete action with a clear title and description.
-8. Estimate each task's duration in minutes.
+8. Estimate each task's duration in minutes. Keep tasks bite-sized and manageable
+   for neurodivergent students (typically between 15 and 45 minutes).
 9. Do not create the calendar schedule. The Python scheduler handles dates.
 10. Do not interpret a total duration as a daily duration unless the user
     explicitly requests a daily or recurring activity.
@@ -183,7 +188,8 @@ IMPORTANT REQUIREMENTS:
                     "content": user_prompt,
                 },
             ],
-            temperature=0.2,
+            temperature=0,
+            max_completion_tokens=2500,
             response_format={"type": "json_object"},
         )
     except Exception as error:
@@ -210,9 +216,13 @@ IMPORTANT REQUIREMENTS:
 
     plan_data = validated_plan.model_dump()
 
-    # Preserve the existing scheduler's expected duration field.
+    # Preserve the existing scheduler's expected duration field and normalize unicode dashes.
     for task in plan_data["tasks"]:
         if "duration_minutes" in task:
             task["duration"] = int(task["duration_minutes"])
+        if "title" in task and isinstance(task["title"], str):
+            task["title"] = task["title"].replace("\u2011", "-").replace("\u2013", "-").replace("\u2014", "-")
+        if "description" in task and isinstance(task["description"], str):
+            task["description"] = task["description"].replace("\u2011", "-").replace("\u2013", "-").replace("\u2014", "-")
 
     return plan_data

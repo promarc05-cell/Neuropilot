@@ -94,32 +94,48 @@ def _create_progressive_daily_schedule(
     deadline: date,
     daily_minutes: int,
 ) -> list[dict]:
-    """Repeat the same task plan each day without changing durations."""
+    """Schedule recurring or progressive practice across each day up to the deadline."""
 
     total_days = (deadline - start_date).days + 1
 
-    if total_days <= 0:
+    if total_days <= 0 or not tasks:
         return []
 
-    total_task_minutes = sum(task["duration"] for task in tasks)
-
-    if total_task_minutes > daily_minutes:
-        raise ValueError(
-            f"Recurring tasks require {total_task_minutes} minutes per day, "
-            f"but the daily limit is {daily_minutes} minutes."
-        )
+    for task in tasks:
+        duration = task["duration"]
+        if duration > daily_minutes:
+            raise ValueError(
+                f"Task '{task['title']}' requires {duration} minutes, "
+                f"but only {daily_minutes} minutes are available per day."
+            )
 
     schedule = []
+    current_date = start_date
+    used_minutes = 0
+    task_index = 0
+    num_tasks = len(tasks)
 
-    for day_index in range(total_days):
-        current_date = start_date + timedelta(days=day_index)
+    while current_date <= deadline:
+        task = tasks[task_index % num_tasks]
+        duration = task["duration"]
 
-        for task in tasks:
-            schedule.append({
-                **task,
-                "scheduled_date": current_date.isoformat(),
-                "title": f"Day {day_index + 1}: {task['title']}",
-            })
+        if used_minutes + duration > daily_minutes:
+            current_date += timedelta(days=1)
+            used_minutes = 0
+            if current_date > deadline:
+                break
+
+        schedule.append({
+            **task,
+            "scheduled_date": current_date.isoformat(),
+        })
+        used_minutes += duration
+        task_index += 1
+
+        # If a complete cycle of tasks finished on this day, advance to next day
+        if task_index % num_tasks == 0:
+            current_date += timedelta(days=1)
+            used_minutes = 0
 
     return schedule
 
@@ -131,7 +147,7 @@ def create_assignment_schedule(
 ) -> dict:
     """Analyze an assignment, generate tasks, and create its schedule."""
 
-    assignment = analyze_assignment(raw_text)
+    assignment = analyze_assignment(raw_text, start_date=start_date)
     deadline = assignment.get("deadline")
 
     if deadline is None:
@@ -178,6 +194,25 @@ def create_assignment_schedule(
         )
     else:
         schedule_minutes = daily_minutes
+
+    # Ensure individual tasks do not exceed daily capacity
+    chunked_tasks = []
+    for task in tasks:
+        dur = task.get("duration", 0)
+        if dur > schedule_minutes:
+            parts = (dur + schedule_minutes - 1) // schedule_minutes
+            part_dur = dur // parts
+            remainder = dur % parts
+            for p in range(parts):
+                p_dur = part_dur + (1 if p < remainder else 0)
+                chunked_tasks.append({
+                    **task,
+                    "title": f"{task['title']} (Part {p + 1})",
+                    "duration": p_dur,
+                })
+        else:
+            chunked_tasks.append(task)
+    tasks = chunked_tasks
 
     schedule = create_schedule(
         tasks=tasks,

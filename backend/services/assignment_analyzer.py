@@ -3,30 +3,65 @@ from datetime import date
 from typing import Optional
 
 
+MONTH_NAME_MAP = {
+    "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
+    "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
+    "aug": 8, "august": 8, "sep": 9, "september": 9, "oct": 10, "october": 10,
+    "nov": 11, "november": 11, "dec": 12, "december": 12,
+}
+
+
 def _extract_deadline(text: str) -> Optional[date]:
+    # 1. Numeric with optional ordinals: 26/10/26, 26-10-2026, 26th 10, 26th
     match = re.search(
-        r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?\b",
+        r"\b(\d{1,2})(?:st|nd|rd|th)?[\s/,-]+(\d{1,2})(?:st|nd|rd|th)?(?:[\s/,-]+(\d{2,4})(?:st|nd|rd|th)?)?\b",
         text,
+        re.IGNORECASE,
     )
 
-    if not match:
-        return None
+    if match:
+        day = int(match.group(1))
+        month = int(match.group(2))
+        year_text = match.group(3)
 
-    day = int(match.group(1))
-    month = int(match.group(2))
-    year_text = match.group(3)
+        if year_text:
+            year = int(year_text)
+            if year < 100:
+                year += 2000
+        else:
+            year = date.today().year
 
-    if year_text:
-        year = int(year_text)
-        if year < 100:
-            year += 2000
-    else:
-        year = date.today().year
+        try:
+            return date(year, month, day)
+        except ValueError:
+            pass
 
-    try:
-        return date(year, month, day)
-    except ValueError:
-        return None
+    # 2. Text month: 26 Oct 2026, 26th October 2026, Oct 26 2026
+    text_month_match = re.search(
+        r"\b(\d{1,2})(?:st|nd|rd|th)?\s+([a-zA-Z]+)(?:[\s,]+(\d{2,4})(?:st|nd|rd|th)?)?\b",
+        text,
+        re.IGNORECASE,
+    )
+
+    if text_month_match:
+        month_str = text_month_match.group(2).lower()
+        if month_str in MONTH_NAME_MAP:
+            day = int(text_month_match.group(1))
+            month = MONTH_NAME_MAP[month_str]
+            year_text = text_month_match.group(3)
+            if year_text:
+                year = int(year_text)
+                if year < 100:
+                    year += 2000
+            else:
+                year = date.today().year
+
+            try:
+                return date(year, month, day)
+            except ValueError:
+                pass
+
+    return None
 
 
 def _extract_number(
@@ -93,58 +128,123 @@ def _extract_duration_minutes(
     return None
 
 
+def _clean_subject(candidate: str) -> Optional[str]:
+    """Clean extracted subject and normalize common subject names."""
+    if not candidate:
+        return None
+
+    # Remove leading prepositions/articles/page descriptors
+    candidate = re.sub(
+        r"^(?:for|in|about|regarding|on|to|the|a|an|\d+[- ]pages?|page)\s+",
+        "",
+        candidate.strip(),
+        flags=re.IGNORECASE,
+    ).strip()
+
+    # Remove trailing date or deadline remnants
+    candidate = re.sub(
+        r"\s+(?:in|by|on|due|upto|until)\s+.*$",
+        "",
+        candidate,
+        flags=re.IGNORECASE,
+    ).strip()
+
+    candidate = candidate.rstrip(".,!?")
+
+    if not candidate or candidate.lower() in [
+        "daily", "placement", "exam", "test", "interview", "homework",
+    ]:
+        return candidate.capitalize() if candidate else None
+
+    # Specific common subjects normalization
+    if candidate.lower() == "dsa":
+        return "DSA"
+
+    return candidate
+
+
 def _extract_subject(
     text: str,
     assignment_type: str,
 ) -> Optional[str]:
-
-    patterns = []
-
     if assignment_type == "study":
-
-        patterns = [
-            r"\bpractice\s+(.+?)(?=\s+(?:for|upto|until|by|daily)\b|$)",
-            r"\bstudy\s+(.+?)(?=\s+(?:for|upto|until|by|daily)\b|$)",
-            r"\blearn\s+(.+?)(?=\s+(?:for|upto|until|by|daily)\b|$)",
-            r"\bprepare\s+(?:for\s+)?(.+?)(?=\s+(?:for|upto|until|by|daily)\b|$)",
-        ]
-
-    elif assignment_type == "writing":
-
-        patterns = [
-            r"(?:paper|essay|report|article)"
-            r"\s+(?:about|on|regarding)\s+"
-            r"(.+?)(?=\s+(?:by|due|upto|until)\b|$)",
-        ]
-
-    elif assignment_type == "presentation":
-
-        patterns = [
-            r"(?:presentation|slides?)"
-            r"\s+(?:about|on|regarding)\s+"
-            r"(.+?)(?=\s+(?:by|due|upto|until)\b|$)",
-        ]
-
-    for pattern in patterns:
-
-        match = re.search(
-            pattern,
+        # 1. Subject before practice/study/prep (e.g. "Dsa practice", "Python study", "Math revision")
+        prefix_match = re.search(
+            r"\b([a-zA-Z0-9+#]+(?:\s+[a-zA-Z0-9+#]+)?)\s+(?:practice|study|prep|preparation|revision|learning)\b",
             text,
             re.IGNORECASE,
         )
+        if prefix_match:
+            sub = _clean_subject(prefix_match.group(1))
+            if sub and sub.lower() not in ["daily", "every", "per"]:
+                return sub
 
-        if match:
+        # 2. Subject after practice/study/learn/prepare (e.g. "practice DSA for placement")
+        postfix_match = re.search(
+            r"\b(?:practice|study|learn|prepare|revise)\s+(?:for\s+)?([a-zA-Z0-9+#]+(?:\s+[a-zA-Z0-9+#]+)?)\b(?:\s+(?:for|upto|until|by|in|before|due|daily)\b|$)",
+            text,
+            re.IGNORECASE,
+        )
+        if postfix_match:
+            sub = _clean_subject(postfix_match.group(1))
+            if sub and sub.lower() not in ["daily", "every", "per"]:
+                return sub
 
-            subject = match.group(1).strip()
-            subject = subject.rstrip(".,!?")
+        # 3. Purpose as fallback (e.g. "practice for placement in 26/10/26")
+        purpose_match = re.search(
+            r"\b(?:for|towards)\s+([a-zA-Z0-9+#]+(?:\s+[a-zA-Z0-9+#]+)?)\b",
+            text,
+            re.IGNORECASE,
+        )
+        if purpose_match:
+            sub = _clean_subject(purpose_match.group(1))
+            if sub:
+                return sub
 
-            if subject:
-                return subject
+    elif assignment_type == "writing":
+        # Before or after paper/essay/report
+        patterns = [
+            r"\b([a-zA-Z0-9+#]+(?:\s+[a-zA-Z0-9+#]+)?)\s+(?:paper|essay|report|article)\b",
+            r"(?:paper|essay|report|article)\s+(?:about|on|regarding)\s+([a-zA-Z0-9+#]+(?:\s+[a-zA-Z0-9+#]+)?)(?=\s+(?:by|due|upto|until)\b|$)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                sub = _clean_subject(match.group(1))
+                if sub:
+                    return sub
+
+    elif assignment_type == "presentation":
+        patterns = [
+            r"\b([a-zA-Z0-9+#]+(?:\s+[a-zA-Z0-9+#]+)?)\s+(?:presentation|slides?|ppt)\b",
+            r"(?:presentation|slides?|ppt)\s+(?:about|on|regarding)\s+([a-zA-Z0-9+#]+(?:\s+[a-zA-Z0-9+#]+)?)(?=\s+(?:by|due|upto|until)\b|$)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                sub = _clean_subject(match.group(1))
+                if sub:
+                    return sub
+
+    elif assignment_type == "project":
+        patterns = [
+            r"\b([a-zA-Z0-9+#]+(?:\s+[a-zA-Z0-9+#]+)?)\s+(?:project|app|application|website)\b",
+            r"(?:build|develop|create)\s+(?:a\s+|an\s+)?([a-zA-Z0-9+#]+(?:\s+[a-zA-Z0-9+#]+)?)(?=\s+(?:by|due|upto|until|project)\b|$)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                sub = _clean_subject(match.group(1))
+                if sub:
+                    return sub
 
     return None
 
 
-def analyze_assignment(text: str) -> dict:
+def analyze_assignment(
+    text: str,
+    start_date: Optional[date] = None,
+) -> dict:
 
     if not text or not text.strip():
         raise ValueError(
@@ -257,16 +357,27 @@ def analyze_assignment(text: str) -> dict:
 
     deadline = _extract_deadline(text)
 
+    start = start_date if start_date else date.today()
+    total_days = (deadline - start).days + 1 if deadline else None
+
     # -----------------------------------------------------
     # Detect DAILY requirement
     # -----------------------------------------------------
 
-    daily = bool(
+    explicit_daily = bool(
         re.search(
-            r"\b(?:daily|every\s+day|per\s+day)\b",
+            r"\b(?:daily|every\s+day|per\s+day|each\s+day)\b",
             lower_text,
         )
     )
+
+    if explicit_daily:
+        daily = True
+    elif deadline and assignment_type == "study" and total_days and total_days > 2:
+        # Multi-day study or practice routine up to a deadline
+        daily = True
+    else:
+        daily = False
 
     # -----------------------------------------------------
     # Requirements
@@ -386,5 +497,7 @@ def analyze_assignment(text: str) -> dict:
         "deployment_required": deployment_required,
         "testing_required": testing_required,
         "deadline": deadline,
+        "start_date": start,
+        "total_days": total_days,
         "estimated_hours": estimated_hours,
     }
